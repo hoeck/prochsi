@@ -8,11 +8,20 @@ import socket
 import traceback
 import Queue
 import threading
-
+import argparse
 from urlparse import urlparse
 
+# constants
+
 BUFSIZE = 2**16
-FILE_QUEUE = Queue.Queue()
+
+# utils
+
+def data_len(d):
+    """Given a list of strings, return its total len."""
+    return sum(len(s) for s in d)
+
+# proxy server
 
 class SocketReader(object):
 
@@ -68,7 +77,7 @@ class SocketReader(object):
             else:
                 strings.append(self._buf)
                 self._buf = ""
-        
+
         while True:
             r,w,x = select.select([self._s], [], [])
             d = self._s.recv(BUFSIZE)
@@ -82,7 +91,11 @@ class SocketReader(object):
             else:
                 strings.append(d)
 
-    def forward(self, dest, max_bytes=-1, store=False):
+    def forward(self, dest, max_bytes=-1):
+        """Forward max_bytes or ALL the data (-1) to socket dest.
+
+        Return the forwarded data as a list of strings.
+        """
         # src dest being two sockets
         remaining = max_bytes if max_bytes > -1 else 2**62
 
@@ -91,14 +104,12 @@ class SocketReader(object):
         # clear buf
         if self._buf:
             if len(self._buf) > remaining:
-                if store:
-                    sdata.append(self._buf[:remaining])
+                sdata.append(self._buf[:remaining])
                 dest.sendall(self._buf[:remaining])
                 self._buf = self._buf[remaining:]
                 remaining = 0
             else:
-                if store:
-                    sdata.append(self._buf)
+                sdata.append(self._buf)
                 dest.sendall(self._buf)
                 remaining -= len(self._buf)
                 self._buf = ""
@@ -109,19 +120,20 @@ class SocketReader(object):
                 d = self._s.recv(min(remaining, BUFSIZE))
                 if not d:
                     break
-                if store:
-                    sdata.append(d)
+                sdata.append(d)
                 dest.sendall(d)
                 remaining -= len(d)
 
-        if store:
-            FILE_QUEUE.put(sdata)
+        return sdata
+
 
 class HTTPProxyHandler(SocketServer.BaseRequestHandler):
     """handles a connection from the client, can handle multiple requests"""
 
-    def should_store_content(self, header):
-        return 'audio' in header.get('Content-Type',[''])[0].lower()
+    @classmethod
+    def configure(self, store_response=None):
+        """Set the store_response predicate function."""
+        self.store_response = store_response or (lambda handler, response_line, response_header, response_data: None)
 
     def parse_request(self, line):
         """parse a request line"""
@@ -212,9 +224,10 @@ class HTTPProxyHandler(SocketServer.BaseRequestHandler):
             if not request_line:
                 return
 
-            print "  REQUEST", repr(request_line)[:40]
             method, url, version = self.parse_request(request_line)
             header = self.read_header(self.client_rdr)
+
+            print "  %s %s" % (method, url)
 
             if header.get('Connection') == 'close':
                 close = True
@@ -259,16 +272,21 @@ class HTTPProxyHandler(SocketServer.BaseRequestHandler):
                 self.write_headers(self.request, response_header)
 
                 # body -> client
+                response_data = []
                 if 'Content-Length' in response_header:
                     cl = int(response_header['Content-Length'][0])
                     if cl:
-                        self.server_rdr.forward(self.request, cl, store=self.should_store_content(response_header))
+                        response_data = self.server_rdr.forward(self.request, cl)
                     if response_header.get('Connection') == ['close']:
                         close = True
                 else:
                     # forward all the data
-                    self.server_rdr.forward(self.request, store=self.should_store_content(response_header))
+                    response_data = self.server_rdr.forward(self.request)
                     close = True
+
+                # call the store hook
+                if response_data:
+                    self.store_response(response_line, response_header, response_data)
 
                 if header.get("Proxy-Connection") != ["keep-alive"] or close:
                     self.server_socket.shutdown(socket.SHUT_RDWR) # or close?
@@ -283,6 +301,7 @@ class HTTPProxyHandler(SocketServer.BaseRequestHandler):
         except:
             traceback.print_exc()
 
+
 class HttpProxyServer(SocketServer.ThreadingMixIn,
                       SocketServer.TCPServer):
     allow_reuse_address = True
@@ -296,6 +315,8 @@ class HttpProxyServer(SocketServer.ThreadingMixIn,
     def handle_error(self, request, addr):
         pass
 
+# writing contents to disk
+
 def get_max_filename_idx(path):
     n = 0
     for f in os.listdir(path):
@@ -304,11 +325,10 @@ def get_max_filename_idx(path):
             n = max(n, int(m.group(1)))
     return n
 
-def file_write_worker():
-    path = "contents"
+def file_write_worker(queue, path):
     idx = get_max_filename_idx(path)
     while True:
-        fdata = FILE_QUEUE.get()
+        fdata = queue.get()
 
         # write the file
         idx += 1
@@ -321,11 +341,51 @@ def file_write_worker():
                 f.write(s)
             print "    done writing %skb" % (bytes / 1000,)
 
-if __name__ == "__main__":
-    fw = threading.Thread(target=file_write_worker)
+# content filter
+
+def create_store_response_f(queue, args):
+    """Create and return a store_response function for use with the HttpProxyHandler."""
+
+    min_size = int(args.min) * 1000
+    max_size = int(args.max) * 1000
+
+    def store_response(handler, response_line, response_header, response_data):
+        if args.content_type in response_header.get('Content-Type',[''])[0].lower():
+            dlen = data_len(response_data)
+            if min_size < dlen and dlen < max_size:
+                queue.put(response_data)
+
+    return store_response
+
+# main
+
+def main():
+    args = parse_args()
+
+    if not os.path.exists(args.path):
+        os.makedirs(args.path)
+
+    queue = Queue.Queue()
+
+    fw = threading.Thread(target=lambda: file_write_worker(queue, args.path))
     fw.setDaemon(True)
     fw.start()
 
-    server = HttpProxyServer(("localhost", 8080))
+    HTTPProxyHandler.configure(create_store_response_f(queue, args))
+    server = HttpProxyServer(addr=("localhost", 8080), handler=HTTPProxyHandler)
+
     print "prochsi listening on localhost:8080"
     server.serve_forever()
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Start a proxy on localhost and capture interesting data to PATH")
+    p.add_argument('-t', '--content-type', help="if this substring is contained in a responses 'Content-Type' header, store the content body in PATH (defaults to 'audio').", default='audio')
+    p.add_argument('--min', help="Min content size in kbytes, everything smaller is not stored (defaults to 200).", default="200")
+    p.add_argument('--max', help="Max content size in kbytes, everything larger is not stored (defaults to 200000).", default="200000")
+    p.add_argument('path', metavar='PATH', help="path to store the contents")
+
+    return p.parse_args()
+
+if __name__ == "__main__":
+    main()
